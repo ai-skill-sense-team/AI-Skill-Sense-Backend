@@ -1,23 +1,35 @@
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+import logging
 import os
 from random import uniform
-import httpx
-import logging
 import time
-
+import httpx
 
 logger = logging.getLogger(__name__)
+
 MAIN_AGENT_MAX_ATTEMPTS = 5
-MAIN_AGENT_RETRYABLE_STATUSES = {429, 503}
-MAIN_AGENT_RETRYABLE_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout)
+MAIN_AGENT_RETRYABLE_STATUSES = {429, 502, 503, 504}
+MAIN_AGENT_RETRYABLE_ERRORS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadTimeout,
+    httpx.RemoteProtocolError,
+)
 MAIN_AGENT_CONNECT_TIMEOUT_SECONDS = 300.0
 MAIN_AGENT_READ_TIMEOUT_SECONDS = 300.0
 MAIN_AGENT_RETRY_DELAY_CAP_SECONDS = 300
 
+# Standard browser User-Agent to bypass Cloudflare Bot Management on *.onrender.com
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
 
 def _backoff_delay(attempt: int) -> float:
-    # Start with a gentler 10s base, scale up, and add random jitter (0-5s) to avoid synchronized retries
+    # Start with a gentler 10s base, scale up, and add random jitter (0-5s)
     base_delay = min(10 * (2 ** attempt), MAIN_AGENT_RETRY_DELAY_CAP_SECONDS)
     jitter = uniform(0, 5)
     return base_delay + jitter
@@ -45,24 +57,61 @@ def _retry_delay(response: httpx.Response, attempt: int) -> float:
     return _backoff_delay(attempt)
 
 
+def _public_headers() -> dict[str, str]:
+    """Headers for unauthenticated GET requests (like health/wake-up pings)."""
+    return {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+    }
+
+
 def _agent_headers() -> dict[str, str]:
+    """Headers for authenticated POST triggers to the Agent service."""
     secret = os.getenv("AGENT_SECRET_KEY")
     if not secret:
         raise RuntimeError("AGENT_SECRET_KEY is not configured.")
-    return {"X-Agent-Secret": secret}
+    return {
+        **_public_headers(),
+        "X-Agent-Secret": secret,
+        "Content-Type": "application/json",
+    }
 
 
-def ping_agent_service() -> dict:
-    """Check whether the separate agent service is reachable."""
-    agent_url = os.getenv(
+def _get_agent_url() -> str:
+    return os.getenv(
         "AGENT_SERVICE_URL",
         "http://127.0.0.1:8001",
     ).rstrip("/")
 
+
+def _ensure_agent_awake(agent_url: str) -> None:
+    """
+    Sends a GET request to wake up the Render Free Tier container if it is spun down.
+    Wait up to 90s for the cold boot to complete before sending POST payloads.
+    """
+    try:
+        httpx.get(
+            f"{agent_url}/",
+            headers=_public_headers(),
+            timeout=90.0,
+            follow_redirects=True,
+        )
+    except httpx.HTTPError as exc:
+        logger.debug("Wake-up ping encountered a transient error: %s", exc)
+
+
+def ping_agent_service() -> dict:
+    """Check whether the separate agent service is reachable."""
+    agent_url = _get_agent_url()
+
     try:
         response = httpx.get(
             f"{agent_url}/",
-            timeout=3.0,
+            headers=_public_headers(),
+            timeout=15.0,  # Increased from 3.0s to tolerate slight Render latency
+            follow_redirects=True,
         )
         response.raise_for_status()
         return {
@@ -91,39 +140,22 @@ def ping_agent_service() -> dict:
         }
 
 
-def trigger_main_agent(
-    update_id: str,
-    user_id: str,
-    action_required: str,
-) -> dict:
-    """
-    Dispatches the main agent trigger payload to the separate LangGraph agent service
-    using an HTTP POST request and the internal AGENT_SECRET_KEY for authentication.
-    """
-    agent_url = os.getenv(
-        "AGENT_SERVICE_URL",
-        "http://127.0.0.1:8001",
-    ).rstrip("/")
+def _post_to_agent(path: str, payload: dict, caller_name: str) -> dict:
+    """Shared HTTP POST dispatcher with wake-up ping, custom headers, and retries."""
+    agent_url = _get_agent_url()
+    headers = _agent_headers()
+    endpoint = f"{agent_url}{path}"
 
-    agent_secret_key = os.getenv("AGENT_SECRET_KEY")
+    # Wake up the Render service prior to first POST attempt
+    _ensure_agent_awake(agent_url)
 
-    if not agent_secret_key:
-        raise RuntimeError("AGENT_SECRET_KEY is not configured.")
-    headers = {"X-Agent-Secret": agent_secret_key}
-
-    payload = {
-        "update_id": update_id,
-        "user_id": user_id,
-        "action_required": action_required,
-    }
-
-    endpoint = f"{agent_url}/agents/main-agent/trigger"
     for attempt in range(MAIN_AGENT_MAX_ATTEMPTS):
         try:
             response = httpx.post(
                 endpoint,
                 json=payload,
                 headers=headers,
+                follow_redirects=True,
                 timeout=httpx.Timeout(
                     MAIN_AGENT_READ_TIMEOUT_SECONDS,
                     connect=MAIN_AGENT_CONNECT_TIMEOUT_SECONDS,
@@ -134,23 +166,25 @@ def trigger_main_agent(
         except MAIN_AGENT_RETRYABLE_ERRORS as exc:
             if attempt + 1 == MAIN_AGENT_MAX_ATTEMPTS:
                 raise RuntimeError(
-                    "Failed to communicate with the Main Agent service after "
+                    f"Failed to communicate with {caller_name} after "
                     f"{MAIN_AGENT_MAX_ATTEMPTS} attempts."
                 ) from exc
             delay = _backoff_delay(attempt)
             logger.warning(
-                "Main Agent request failed transiently; retrying in %.0f "
+                "%s request failed transiently; retrying in %.0f "
                 "seconds (attempt %d/%d): %s",
+                caller_name,
                 delay,
                 attempt + 2,
                 MAIN_AGENT_MAX_ATTEMPTS,
                 exc,
             )
             time.sleep(delay)
+            _ensure_agent_awake(agent_url)
             continue
         except httpx.HTTPError as exc:
             raise RuntimeError(
-                "Failed to communicate with the Main Agent service."
+                f"Failed to communicate with {caller_name}."
             ) from exc
 
         if (
@@ -159,9 +193,10 @@ def trigger_main_agent(
         ):
             delay = _retry_delay(response, attempt)
             logger.warning(
-                "Main Agent returned HTTP %d; retrying in %.0f seconds "
+                "%s returned HTTP %d; retrying in %.0f seconds "
                 "(attempt %d/%d, server=%s, render_id=%s, cf_ray=%s, "
                 "retry_after=%s).",
+                caller_name,
                 response.status_code,
                 delay,
                 attempt + 2,
@@ -172,6 +207,8 @@ def trigger_main_agent(
                 response.headers.get("Retry-After", "unavailable"),
             )
             time.sleep(delay)
+            # Re-ping with GET on retry in case container is still spinning up
+            _ensure_agent_awake(agent_url)
             continue
 
         try:
@@ -179,8 +216,9 @@ def trigger_main_agent(
         except httpx.HTTPStatusError as exc:
             if response.status_code in MAIN_AGENT_RETRYABLE_STATUSES:
                 logger.error(
-                    "Main Agent exhausted retries after HTTP %d "
+                    "%s exhausted retries after HTTP %d "
                     "(server=%s, render_id=%s, cf_ray=%s, retry_after=%s).",
+                    caller_name,
                     response.status_code,
                     response.headers.get("Server", "unknown"),
                     response.headers.get("rndr-id", "unavailable"),
@@ -188,22 +226,44 @@ def trigger_main_agent(
                     response.headers.get("Retry-After", "unavailable"),
                 )
             raise RuntimeError(
-                "Main Agent service returned HTTP "
+                f"{caller_name} service returned HTTP "
                 f"{response.status_code} after {attempt + 1} attempt(s)."
             ) from exc
+
         try:
-            agent_response = response.json()
+            return response.json()
         except ValueError as exc:
             raise RuntimeError(
-                "Main Agent service returned invalid JSON after a successful response."
+                f"{caller_name} service returned invalid JSON after a successful response."
             ) from exc
-        return {
-            "status": "success",
-            "message": "Main Agent triggered successfully.",
-            "agent_response": agent_response,
-        }
 
-    raise RuntimeError("Main Agent trigger exhausted retries without a response.")
+    raise RuntimeError(f"{caller_name} trigger exhausted retries without a response.")
+
+
+def trigger_main_agent(
+    update_id: str,
+    user_id: str,
+    action_required: str,
+) -> dict:
+    """
+    Dispatches the main agent trigger payload to the separate LangGraph agent service
+    using an HTTP POST request and the internal AGENT_SECRET_KEY for authentication.
+    """
+    payload = {
+        "update_id": update_id,
+        "user_id": user_id,
+        "action_required": action_required,
+    }
+    agent_response = _post_to_agent(
+        "/agents/main-agent/trigger",
+        payload,
+        "Main Agent",
+    )
+    return {
+        "status": "success",
+        "message": "Main Agent triggered successfully.",
+        "agent_response": agent_response,
+    }
 
 
 def trigger_main_agent_in_background(
@@ -224,33 +284,21 @@ def trigger_main_agent_in_background(
 
 
 def trigger_extractor(url_id: str, url: str) -> dict:
-    agent_url = os.getenv(
-        "AGENT_SERVICE_URL",
-        "http://127.0.0.1:8001",
-    ).rstrip("/")
-    response = httpx.post(
-        f"{agent_url}/agents/extractor/trigger",
-        json={"url_id": url_id, "url": url, "is_visited": "No"},
-        headers=_agent_headers(),
-        timeout=300.0,
+    payload = {"url_id": url_id, "url": url, "is_visited": "No"}
+    return _post_to_agent(
+        "/agents/extractor/trigger",
+        payload,
+        "Extractor Agent",
     )
-    response.raise_for_status()
-    return response.json()
 
 
 def trigger_quest_maker(skill_id: str) -> dict:
-    agent_url = os.getenv(
-        "AGENT_SERVICE_URL",
-        "http://127.0.0.1:8001",
-    ).rstrip("/")
-    response = httpx.post(
-        f"{agent_url}/agents/quest-maker/trigger",
-        json={"skill_id": skill_id},
-        headers=_agent_headers(),
-        timeout=300.0,
+    payload = {"skill_id": skill_id}
+    return _post_to_agent(
+        "/agents/quest-maker/trigger",
+        payload,
+        "Quest Maker Agent",
     )
-    response.raise_for_status()
-    return response.json()
 
 
 def trigger_quest_maker_in_background(skill_id: str) -> None:

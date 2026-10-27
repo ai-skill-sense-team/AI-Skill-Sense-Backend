@@ -497,7 +497,7 @@ def create_user_log_route(
 def assign_user_recommendation(
     user_id: str,
     request: UserAssignmentRequest,
-    background_tasks: BackgroundTasks, # Added background_tasks parameter
+    background_tasks: BackgroundTasks,  # <-- 1. Add this parameter here
     db: Session = Depends(get_db),
     datapool_db: Session = Depends(get_datapool_db),
     current_user: User = Depends(get_current_user),
@@ -537,16 +537,6 @@ def assign_user_recommendation(
             }
 
         db.add(UserSkill(user_id=user_id, skill_id=request.item_id))
-        
-        # FIX: Trigger log for new skill assignment
-        create_user_log(
-            db,
-            background_tasks,
-            user_id,
-            "new_skill",
-            f"Assigned new skill {request.item_id}.",
-            event_id=f"skill-assignment:{request.item_id}",
-        )
     else:
         item = (
             datapool_db.query(Quest)
@@ -584,16 +574,6 @@ def assign_user_recommendation(
                 status="active",
             )
         )
-        
-        # FIX: Trigger log for new quest assignment
-        create_user_log(
-            db,
-            background_tasks,
-            user_id,
-            "new_quest",
-            f"Assigned new quest {request.item_id}.",
-            event_id=f"quest-assignment:{request.item_id}",
-        )
 
     try:
         db.commit()
@@ -628,6 +608,17 @@ def assign_user_recommendation(
     except Exception:
         db.rollback()
         raise
+
+    # <-- 2. ADD THIS BLOCK RIGHT HERE (after db.commit() succeeds, before return)
+    if request.assignment_type == "Skill":
+        create_user_log(
+            db,
+            background_tasks,
+            user_id,
+            "new_skill",
+            f"Obtained skill: {item.skill_title}",
+            event_id=f"assign-skill:{user_id}:{request.item_id}",
+        )
 
     return {
         "status": "assigned",
