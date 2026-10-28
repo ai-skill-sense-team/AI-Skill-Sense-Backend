@@ -44,7 +44,7 @@ def register_cron_job_on_startup():
         "Content-Type": "application/json",
     }
 
-    # cron-job.org PUT payload to create/update a job hitting the agent every 5 minutes
+    # cron-job.org PUT payload to create/update a job hitting the agent every 10 minutes
     payload = {
         "job": {
             "url": f"{agent_url}/",
@@ -55,7 +55,7 @@ def register_cron_job_on_startup():
                 "timezone": "UTC",
                 "hours": [-1],
                 "mdays": [-1],
-                "minutes": [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55],  # Every 5 mins
+                "minutes": [0, 10, 20, 30, 40, 50],  # Every 10 mins
                 "months": [-1],
                 "wdays": [-1],
             },
