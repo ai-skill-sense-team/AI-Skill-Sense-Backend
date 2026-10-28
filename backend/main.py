@@ -169,3 +169,10 @@ def database_health_check():
         "database": db_result,
         "datapool": dp_result,
     }
+    
+@app.get("/debug/agent")
+def debug_agent():
+    import httpx, os
+    url = os.getenv("AGENT_SERVICE_URL", "").rstrip("/") + "/"
+    r = httpx.get(url, timeout=60, follow_redirects=True)
+    return {"status": r.status_code, "routing": r.headers.get("x-render-routing"), "body": r.text[:200]}
