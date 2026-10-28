@@ -5,6 +5,7 @@ import os
 from random import uniform
 import time
 import httpx
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,43 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/131.0.0.0 Safari/537.36"
 )
+
+# Persistent singleton client with connection pooling and HTTP/2 enabled
+_client_instance: Optional[httpx.Client] = None
+
+
+def _get_agent_url() -> str:
+    return os.getenv(
+        "AGENT_SERVICE_URL",
+        "http://127.0.0.1:8001",
+    ).rstrip("/")
+
+
+def _get_persistent_client() -> httpx.Client:
+    """
+    Returns a persistent singleton httpx.Client configured with HTTP/2 and keep-alive 
+    connection pooling to prevent Cloudflare handshake rate-limiting.
+    """
+    global _client_instance
+    if _client_instance is None:
+        agent_url = _get_agent_url()
+        _client_instance = httpx.Client(
+            base_url=agent_url,
+            http2=True,  # HTTP/2 multiplexing bypasses basic HTTP/1.1 per-connection limits
+            timeout=httpx.Timeout(
+                MAIN_AGENT_READ_TIMEOUT_SECONDS,
+                connect=MAIN_AGENT_CONNECT_TIMEOUT_SECONDS,
+                write=30.0,
+                pool=10.0,
+            ),
+            limits=httpx.Limits(
+                max_keepalive_connections=5,
+                max_connections=10,
+                keepalive_expiry=30.0,
+            ),
+            follow_redirects=True,
+        )
+    return _client_instance
 
 
 def _backoff_delay(attempt: int) -> float:
@@ -79,24 +117,16 @@ def _agent_headers() -> dict[str, str]:
     }
 
 
-def _get_agent_url() -> str:
-    return os.getenv(
-        "AGENT_SERVICE_URL",
-        "http://127.0.0.1:8001",
-    ).rstrip("/")
-
-
-def _ensure_agent_awake(agent_url: str) -> None:
+def _ensure_agent_awake(client: httpx.Client, agent_url: str) -> None:
     """
     Sends a GET request to wake up the Render Free Tier container if it is spun down.
-    Wait up to 90s for the cold boot to complete before sending POST payloads.
+    Uses the persistent client to maintain established session state.
     """
     try:
-        httpx.get(
+        client.get(
             f"{agent_url}/",
             headers=_public_headers(),
             timeout=90.0,
-            follow_redirects=True,
         )
     except httpx.HTTPError as exc:
         logger.debug("Wake-up ping encountered a transient error: %s", exc)
@@ -105,13 +135,13 @@ def _ensure_agent_awake(agent_url: str) -> None:
 def ping_agent_service() -> dict:
     """Check whether the separate agent service is reachable."""
     agent_url = _get_agent_url()
+    client = _get_persistent_client()
 
     try:
-        response = httpx.get(
+        response = client.get(
             f"{agent_url}/",
             headers=_public_headers(),
-            timeout=15.0,  # Increased from 3.0s to tolerate slight Render latency
-            follow_redirects=True,
+            timeout=15.0,  # Increased to tolerate slight Render latency
         )
         response.raise_for_status()
         return {
@@ -141,27 +171,20 @@ def ping_agent_service() -> dict:
 
 
 def _post_to_agent(path: str, payload: dict, caller_name: str) -> dict:
-    """Shared HTTP POST dispatcher with wake-up ping, custom headers, and retries."""
+    """Shared HTTP POST dispatcher with persistent connection pooling and retries."""
     agent_url = _get_agent_url()
     headers = _agent_headers()
-    endpoint = f"{agent_url}{path}"
+    client = _get_persistent_client()
 
     # Wake up the Render service prior to first POST attempt
-    _ensure_agent_awake(agent_url)
+    _ensure_agent_awake(client, agent_url)
 
     for attempt in range(MAIN_AGENT_MAX_ATTEMPTS):
         try:
-            response = httpx.post(
-                endpoint,
+            response = client.post(
+                path,
                 json=payload,
                 headers=headers,
-                follow_redirects=True,
-                timeout=httpx.Timeout(
-                    MAIN_AGENT_READ_TIMEOUT_SECONDS,
-                    connect=MAIN_AGENT_CONNECT_TIMEOUT_SECONDS,
-                    write=30.0,
-                    pool=10.0,
-                ),
             )
         except MAIN_AGENT_RETRYABLE_ERRORS as exc:
             if attempt + 1 == MAIN_AGENT_MAX_ATTEMPTS:
@@ -180,7 +203,7 @@ def _post_to_agent(path: str, payload: dict, caller_name: str) -> dict:
                 exc,
             )
             time.sleep(delay)
-            _ensure_agent_awake(agent_url)
+            _ensure_agent_awake(client, agent_url)
             continue
         except httpx.HTTPError as exc:
             raise RuntimeError(
@@ -207,8 +230,7 @@ def _post_to_agent(path: str, payload: dict, caller_name: str) -> dict:
                 response.headers.get("Retry-After", "unavailable"),
             )
             time.sleep(delay)
-            # Re-ping with GET on retry in case container is still spinning up
-            _ensure_agent_awake(agent_url)
+            _ensure_agent_awake(client, agent_url)
             continue
 
         try:
