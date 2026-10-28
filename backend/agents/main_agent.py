@@ -49,7 +49,6 @@ def _get_persistent_client() -> httpx.Client:
         agent_url = _get_agent_url()
         _client_instance = httpx.Client(
             base_url=agent_url,
-            http2=True,  # HTTP/2 multiplexing bypasses basic HTTP/1.1 per-connection limits
             timeout=httpx.Timeout(
                 MAIN_AGENT_READ_TIMEOUT_SECONDS,
                 connect=MAIN_AGENT_CONNECT_TIMEOUT_SECONDS,
