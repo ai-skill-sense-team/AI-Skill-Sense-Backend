@@ -89,8 +89,8 @@ async def lifespan(app: FastAPI):
     agent_status = ping_agent_service()
     app.state.agent_status = agent_status
 
-    # Register/sync the cron-job.org external trigger asynchronously on boot
-    asyncio.to_thread(register_cron_job_on_startup)
+    # Register/sync the cron-job.org external trigger asynchronously on boot (with await!)
+    await asyncio.to_thread(register_cron_job_on_startup)
 
     # This is to check quest expiry repeatedly
     expiry_task = asyncio.create_task(quest_expiry_loop())
@@ -98,9 +98,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        # Stop the background task before shutdown.
         expiry_task.cancel()
-
         try:
             await expiry_task
         except asyncio.CancelledError:
