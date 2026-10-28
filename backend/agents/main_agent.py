@@ -22,11 +22,7 @@ MAIN_AGENT_READ_TIMEOUT_SECONDS = 300.0
 MAIN_AGENT_RETRY_DELAY_CAP_SECONDS = 300
 
 # Standard browser User-Agent to bypass Cloudflare Bot Management on *.onrender.com
-DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
-)
+DEFAULT_USER_AGENT = "ai-skill-sense-backend/1.0"
 
 # Persistent singleton client with connection pooling and HTTP/2 enabled
 _client_instance: Optional[httpx.Client] = None
@@ -70,6 +66,15 @@ def _backoff_delay(attempt: int) -> float:
     base_delay = min(10 * (2 ** attempt), MAIN_AGENT_RETRY_DELAY_CAP_SECONDS)
     jitter = uniform(0, 5)
     return base_delay + jitter
+
+RATE_LIMIT_DELAY_SECONDS = 60
+
+
+def _rate_limit_delay(response: httpx.Response, attempt: int) -> float:
+    """On 429, honor Retry-After if present, else wait a long flat interval."""
+    if response.headers.get("Retry-After"):
+        return _retry_delay(response, attempt)
+    return RATE_LIMIT_DELAY_SECONDS + uniform(0, 5)
 
 
 def _retry_delay(response: httpx.Response, attempt: int) -> float:
@@ -115,22 +120,6 @@ def _agent_headers() -> dict[str, str]:
         "Content-Type": "application/json",
     }
 
-
-def _ensure_agent_awake(client: httpx.Client, agent_url: str) -> None:
-    """
-    Sends a GET request to wake up the Render Free Tier container if it is spun down.
-    Uses the persistent client to maintain established session state.
-    """
-    try:
-        client.get(
-            f"{agent_url}/",
-            headers=_public_headers(),
-            timeout=90.0,
-        )
-    except httpx.HTTPError as exc:
-        logger.debug("Wake-up ping encountered a transient error: %s", exc)
-
-
 def ping_agent_service() -> dict:
     """Check whether the separate agent service is reachable."""
     agent_url = _get_agent_url()
@@ -171,20 +160,12 @@ def ping_agent_service() -> dict:
 
 def _post_to_agent(path: str, payload: dict, caller_name: str) -> dict:
     """Shared HTTP POST dispatcher with persistent connection pooling and retries."""
-    agent_url = _get_agent_url()
     headers = _agent_headers()
     client = _get_persistent_client()
 
-    # Wake up the Render service prior to first POST attempt
-    _ensure_agent_awake(client, agent_url)
-
     for attempt in range(MAIN_AGENT_MAX_ATTEMPTS):
         try:
-            response = client.post(
-                path,
-                json=payload,
-                headers=headers,
-            )
+            response = client.post(path, json=payload, headers=headers)
         except MAIN_AGENT_RETRYABLE_ERRORS as exc:
             if attempt + 1 == MAIN_AGENT_MAX_ATTEMPTS:
                 raise RuntimeError(
@@ -195,57 +176,41 @@ def _post_to_agent(path: str, payload: dict, caller_name: str) -> dict:
             logger.warning(
                 "%s request failed transiently; retrying in %.0f "
                 "seconds (attempt %d/%d): %s",
-                caller_name,
-                delay,
-                attempt + 2,
-                MAIN_AGENT_MAX_ATTEMPTS,
-                exc,
+                caller_name, delay, attempt + 2, MAIN_AGENT_MAX_ATTEMPTS, exc,
             )
             time.sleep(delay)
-            _ensure_agent_awake(client, agent_url)
             continue
         except httpx.HTTPError as exc:
-            raise RuntimeError(
-                f"Failed to communicate with {caller_name}."
-            ) from exc
+            raise RuntimeError(f"Failed to communicate with {caller_name}.") from exc
+
+        if response.status_code == 429:
+            # Diagnostic: shows whether Cloudflare (error 1015) or Render answered
+            logger.warning(
+                "%s got 429. body=%r headers=%s",
+                caller_name,
+                response.text[:300],
+                dict(response.headers),
+            )
 
         if (
             response.status_code in MAIN_AGENT_RETRYABLE_STATUSES
             and attempt + 1 < MAIN_AGENT_MAX_ATTEMPTS
         ):
-            delay = _retry_delay(response, attempt)
+            if response.status_code == 429:
+                delay = _rate_limit_delay(response, attempt)
+            else:
+                delay = _retry_delay(response, attempt)
             logger.warning(
-                "%s returned HTTP %d; retrying in %.0f seconds "
-                "(attempt %d/%d, server=%s, render_id=%s, cf_ray=%s, "
-                "retry_after=%s).",
-                caller_name,
-                response.status_code,
-                delay,
-                attempt + 2,
-                MAIN_AGENT_MAX_ATTEMPTS,
-                response.headers.get("Server", "unknown"),
-                response.headers.get("rndr-id", "unavailable"),
-                response.headers.get("CF-Ray", "unavailable"),
-                response.headers.get("Retry-After", "unavailable"),
+                "%s returned HTTP %d; retrying in %.0f seconds (attempt %d/%d).",
+                caller_name, response.status_code, delay,
+                attempt + 2, MAIN_AGENT_MAX_ATTEMPTS,
             )
             time.sleep(delay)
-            _ensure_agent_awake(client, agent_url)
             continue
 
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            if response.status_code in MAIN_AGENT_RETRYABLE_STATUSES:
-                logger.error(
-                    "%s exhausted retries after HTTP %d "
-                    "(server=%s, render_id=%s, cf_ray=%s, retry_after=%s).",
-                    caller_name,
-                    response.status_code,
-                    response.headers.get("Server", "unknown"),
-                    response.headers.get("rndr-id", "unavailable"),
-                    response.headers.get("CF-Ray", "unavailable"),
-                    response.headers.get("Retry-After", "unavailable"),
-                )
             raise RuntimeError(
                 f"{caller_name} service returned HTTP "
                 f"{response.status_code} after {attempt + 1} attempt(s)."

@@ -86,23 +86,25 @@ async def lifespan(app: FastAPI):
     UserBase.metadata.create_all(bind=db_engine)
     DataPoolBase.metadata.create_all(bind=dp_engine)
 
-    agent_status = ping_agent_service()
-    app.state.agent_status = agent_status
+    app.state.agent_status = {"status": "unknown"}
 
-    # Register/sync the cron-job.org external trigger asynchronously on boot (with await!)
-    await asyncio.to_thread(register_cron_job_on_startup)
+    # Fire-and-forget: don't block startup on the agent, and don't retry
+    async def _startup_checks():
+        app.state.agent_status = await asyncio.to_thread(ping_agent_service)
+        await asyncio.to_thread(register_cron_job_on_startup)
 
-    # This is to check quest expiry repeatedly
+    startup_task = asyncio.create_task(_startup_checks())
     expiry_task = asyncio.create_task(quest_expiry_loop())
 
     try:
         yield
     finally:
-        expiry_task.cancel()
-        try:
-            await expiry_task
-        except asyncio.CancelledError:
-            pass
+        for task in (startup_task, expiry_task):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
         db_engine.dispose()
         dp_engine.dispose()
